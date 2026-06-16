@@ -28,16 +28,23 @@ use serde_json::Value;
 
 const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
+const FLAT_MCP_TOOLS_ENV: &str = "AIOPSTERM_CODEX_FLAT_MCP_TOOLS";
 
 pub struct McpHandler {
     tool_info: ToolInfo,
     spec: ToolSpec,
+    tool_name: ToolName,
 }
 
 impl McpHandler {
     pub fn new(tool_info: ToolInfo) -> Result<Self, serde_json::Error> {
-        let spec = create_tool_spec(&tool_info)?;
-        Ok(Self { tool_info, spec })
+        let tool_name = model_tool_name(&tool_info);
+        let spec = create_tool_spec(&tool_info, &tool_name)?;
+        Ok(Self {
+            tool_info,
+            spec,
+            tool_name,
+        })
     }
 
     fn hook_tool_name(&self) -> HookToolName {
@@ -66,7 +73,7 @@ fn ensure_mcp_prefix(name: &str) -> String {
 
 impl ToolExecutor<ToolInvocation> for McpHandler {
     fn tool_name(&self) -> ToolName {
-        self.tool_info.canonical_tool_name()
+        self.tool_name.clone()
     }
 
     fn spec(&self) -> ToolSpec {
@@ -228,9 +235,14 @@ impl CoreToolRuntime for McpHandler {
     }
 }
 
-fn create_tool_spec(tool_info: &ToolInfo) -> Result<ToolSpec, serde_json::Error> {
-    let tool_name = tool_info.canonical_tool_name();
+fn create_tool_spec(
+    tool_info: &ToolInfo,
+    tool_name: &ToolName,
+) -> Result<ToolSpec, serde_json::Error> {
     let tool = mcp_tool_to_responses_api_tool(&tool_name, &tool_info.tool)?;
+    if flatten_mcp_tools_for_provider() {
+        return Ok(ToolSpec::Function(tool));
+    }
     let description = tool_info
         .namespace_description
         .as_deref()
@@ -252,6 +264,21 @@ fn create_tool_spec(tool_info: &ToolInfo) -> Result<ToolSpec, serde_json::Error>
         description,
         tools: vec![ResponsesApiNamespaceTool::Function(tool)],
     }))
+}
+
+fn model_tool_name(tool_info: &ToolInfo) -> ToolName {
+    let canonical = tool_info.canonical_tool_name();
+    if flatten_mcp_tools_for_provider() {
+        ToolName::plain(join_tool_name(&canonical))
+    } else {
+        canonical
+    }
+}
+
+fn flatten_mcp_tools_for_provider() -> bool {
+    std::env::var(FLAT_MCP_TOOLS_ENV)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn mcp_hook_tool_input(raw_arguments: &str) -> Value {
@@ -325,8 +352,32 @@ mod tests {
     use crate::turn_diff_tracker::TurnDiffTracker;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::OnceLock;
     use std::time::Duration;
     use tokio::sync::Mutex;
+
+    fn flat_mcp_env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    fn with_flat_mcp_tools_env<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
+        let _guard = flat_mcp_env_lock()
+            .lock()
+            .expect("flat MCP env lock poisoned");
+        let previous = std::env::var_os(FLAT_MCP_TOOLS_ENV);
+        match value {
+            Some(value) => unsafe { std::env::set_var(FLAT_MCP_TOOLS_ENV, value) },
+            None => unsafe { std::env::remove_var(FLAT_MCP_TOOLS_ENV) },
+        }
+        let result = run();
+        match previous {
+            Some(value) => unsafe { std::env::set_var(FLAT_MCP_TOOLS_ENV, value) },
+            None => unsafe { std::env::remove_var(FLAT_MCP_TOOLS_ENV) },
+        }
+        result
+    }
 
     #[tokio::test]
     async fn mcp_pre_tool_use_payload_uses_prefixed_tool_name_and_raw_args() {
@@ -517,6 +568,58 @@ mod tests {
                 .expect("MCP tool spec should build")
                 .supports_parallel_tool_calls()
         );
+    }
+
+    #[test]
+    fn mcp_tool_spec_uses_namespace_by_default() {
+        with_flat_mcp_tools_env(None, || {
+            let handler = McpHandler::new(tool_info(
+                "aiopsterm_remote",
+                "mcp__aiopsterm_remote",
+                "target_context",
+            ))
+            .expect("MCP tool spec should build");
+
+            assert_eq!(
+                handler.tool_name(),
+                codex_tools::ToolName::namespaced("mcp__aiopsterm_remote", "target_context")
+            );
+            match handler.spec() {
+                ToolSpec::Namespace(namespace) => {
+                    assert_eq!(namespace.name, "mcp__aiopsterm_remote");
+                    let ResponsesApiNamespaceTool::Function(tool) = &namespace.tools[0];
+                    assert_eq!(tool.name, "target_context");
+                }
+                _ => {
+                    panic!("MCP tools should use namespace specs by default")
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn mcp_tool_spec_can_flatten_for_openai_compatible_provider() {
+        with_flat_mcp_tools_env(Some("1"), || {
+            let handler = McpHandler::new(tool_info(
+                "aiopsterm_remote",
+                "mcp__aiopsterm_remote",
+                "target_context",
+            ))
+            .expect("MCP tool spec should build");
+
+            assert_eq!(
+                handler.tool_name(),
+                codex_tools::ToolName::plain("mcp__aiopsterm_remote__target_context")
+            );
+            match handler.spec() {
+                ToolSpec::Function(tool) => {
+                    assert_eq!(tool.name, "mcp__aiopsterm_remote__target_context");
+                }
+                _ => {
+                    panic!("flattened MCP tools should use function specs")
+                }
+            }
+        });
     }
 
     fn tool_info(server_name: &str, callable_namespace: &str, tool_name: &str) -> ToolInfo {

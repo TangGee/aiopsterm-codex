@@ -1096,6 +1096,13 @@ impl App {
         turns: Vec<Turn>,
     ) -> Result<()> {
         let thread_id = session.thread_id;
+        let thread_switched = self
+            .primary_thread_id
+            .is_some_and(|current_thread_id| current_thread_id != thread_id);
+        crate::aiopsterm_thread_info::write_primary_thread_info(
+            &session,
+            thread_switched.then_some("switch"),
+        );
         self.primary_thread_id = Some(thread_id);
         self.primary_session_configured = Some(session.clone());
         self.upsert_agent_picker_thread(

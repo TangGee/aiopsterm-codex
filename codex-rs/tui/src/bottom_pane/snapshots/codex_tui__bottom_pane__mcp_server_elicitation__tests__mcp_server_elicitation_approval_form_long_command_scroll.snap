@@ -1,0 +1,38 @@
+---
+source: tui/src/bottom_pane/mcp_server_elicitation.rs
+expression: "format!(\"before scroll:\\n{before_scroll}\\n\\nafter scroll:\\n{after_scroll}\")"
+---
+before scroll:
+                                                                        
+  Field 1/1                                                             
+  Allow the aiopsterm_remote MCP server to run tool "run_command"?      
+                                                                        
+  command: set -o pipefail                                              
+  python3 - <<'PY'                                                      
+  import os, re, subprocess, textwrap                                   
+  root = '/opt/aiopsterm/service'                                       
+  for name in sorted(os.listdir(root)):                                 
+      print(name)                                                       
+  subprocess.run(['systemctl', 'status', 'aiopsterm-agent'],            
+  check=False)                                                          
+  › 1. Allow   Run the tool and continue.                               
+    2. Cancel  Cancel this tool call                                    
+  details 1-10/14 | pgup/pgdn | enter to submit | esc to cancel         
+                                                                        
+
+after scroll:
+                                                                        
+  Field 1/1                                                             
+  import os, re, subprocess, textwrap                                   
+  root = '/opt/aiopsterm/service'                                       
+  for name in sorted(os.listdir(root)):                                 
+      print(name)                                                       
+  subprocess.run(['systemctl', 'status', 'aiopsterm-agent'],            
+  check=False)                                                          
+  print('audit complete')                                               
+  PY                                                                    
+  timeoutMs: 30000                                                      
+                                                                        
+  › 1. Allow   Run the tool and continue.                               
+    2. Cancel  Cancel this tool call                                    
+  details 5-14/14 | pgup/pgdn | enter to submit | esc to cancel

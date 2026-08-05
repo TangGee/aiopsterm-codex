@@ -23,6 +23,18 @@ pub(crate) fn apply_ide_context_to_user_input(
         return false;
     };
 
+    apply_prompt_context_to_user_input(&context_text, items)
+}
+
+pub(crate) fn apply_prompt_context_to_user_input(
+    context_text: &str,
+    items: &mut Vec<UserInput>,
+) -> bool {
+    let context_text = context_text.trim();
+    if context_text.is_empty() {
+        return false;
+    }
+
     let prefix = format!("{context_text}\n{PROMPT_REQUEST_BEGIN}\n");
     if let Some(text_index) = items
         .iter()
@@ -314,6 +326,26 @@ mod tests {
             extract_prompt_request_with_offset(message),
             ("Second", message.find("Second").expect("request offset"))
         );
+    }
+
+    #[test]
+    fn apply_prompt_context_prefixes_arbitrary_context() {
+        let mut items = vec![UserInput::Text {
+            text: "run uptime".to_string(),
+            text_elements: Vec::new(),
+        }];
+
+        assert!(!apply_prompt_context_to_user_input("  ", &mut items));
+        assert!(apply_prompt_context_to_user_input(
+            "[aiopsterm target changed]\nCurrent target: prod",
+            &mut items
+        ));
+
+        let UserInput::Text { text, .. } = &items[0] else {
+            panic!("expected text input");
+        };
+        assert_eq!(extract_prompt_request_with_offset(text).0, "run uptime");
+        assert!(text.contains("[aiopsterm target changed]\nCurrent target: prod"));
     }
 
     #[test]

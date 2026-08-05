@@ -65,6 +65,8 @@ impl ChatWidget {
 
     /// Fetches fresh IDE context for the outgoing user turn and folds it into the prompt.
     pub(super) fn maybe_apply_ide_context(&mut self, items: &mut Vec<UserInput>) {
+        self.maybe_apply_aiopsterm_pending_context(items);
+
         if !self.ide_context.is_enabled() {
             return;
         }
@@ -86,6 +88,23 @@ impl ChatWidget {
                 }
             }
         }
+    }
+
+    fn maybe_apply_aiopsterm_pending_context(&mut self, items: &mut Vec<UserInput>) {
+        let Ok(path) = std::env::var("AIOPSTERM_CODEX_PENDING_CONTEXT_FILE") else {
+            return;
+        };
+        if path.trim().is_empty() {
+            return;
+        }
+        let Ok(context) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let _ = std::fs::write(&path, "");
+        if context.trim().is_empty() {
+            return;
+        }
+        crate::ide_context::apply_prompt_context_to_user_input(&context, items);
     }
 
     fn add_ide_context_status_message(&mut self) {

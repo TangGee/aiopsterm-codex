@@ -53,7 +53,6 @@ use crate::key_hint::KeyBindingListExt;
 use crate::keymap::ListKeymap;
 use crate::render::renderable::Renderable;
 use crate::text_formatting::format_json_compact;
-use crate::text_formatting::truncate_text;
 
 const ANSWER_PLACEHOLDER: &str = "Type your answer";
 const OPTIONAL_ANSWER_PLACEHOLDER: &str = "Type your answer (optional)";
@@ -66,8 +65,7 @@ const APPROVAL_ACCEPT_SESSION_VALUE: &str = "accept_session";
 const APPROVAL_ACCEPT_ALWAYS_VALUE: &str = "accept_always";
 const APPROVAL_DECLINE_VALUE: &str = "decline";
 const APPROVAL_CANCEL_VALUE: &str = "cancel";
-const APPROVAL_TOOL_PARAM_DISPLAY_LIMIT: usize = 3;
-const APPROVAL_TOOL_PARAM_VALUE_TRUNCATE_GRAPHEMES: usize = 60;
+const PROMPT_SCROLL_PAGE_LINES: usize = 8;
 const TOOL_TYPE_KEY: &str = "tool_type";
 const TOOL_ID_KEY: &str = "tool_id";
 const TOOL_SUGGEST_SUGGEST_TYPE_KEY: &str = "suggest_type";
@@ -499,7 +497,6 @@ fn format_tool_approval_display_message(
     }
     let param_lines = approval_display_params
         .iter()
-        .take(APPROVAL_TOOL_PARAM_DISPLAY_LIMIT)
         .map(format_tool_approval_display_param_line)
         .collect::<Vec<_>>();
     if !param_lines.is_empty() {
@@ -519,14 +516,13 @@ fn format_tool_approval_display_param_line(param: &McpToolApprovalDisplayParam) 
 }
 
 fn format_tool_approval_display_param_value(value: &Value) -> String {
-    let formatted = match value {
-        Value::String(text) => text.split_whitespace().collect::<Vec<_>>().join(" "),
+    match value {
+        Value::String(text) => text.replace("\r\n", "\n").replace('\r', "\n"),
         _ => {
             let compact_json = value.to_string();
             format_json_compact(&compact_json).unwrap_or(compact_json)
         }
-    };
-    truncate_text(&formatted, APPROVAL_TOOL_PARAM_VALUE_TRUNCATE_GRAPHEMES)
+    }
 }
 
 fn parse_fields_from_schema(requested_schema: &Value) -> Option<Vec<McpServerElicitationField>> {
@@ -711,6 +707,7 @@ pub(crate) struct McpServerElicitationOverlay {
     composer: ChatComposer,
     answers: Vec<McpServerElicitationAnswerState>,
     current_idx: usize,
+    prompt_scroll_top: usize,
     done: bool,
     validation_error: Option<String>,
     list_keymap: ListKeymap,
@@ -759,6 +756,7 @@ impl McpServerElicitationOverlay {
             composer,
             answers: Vec::new(),
             current_idx: 0,
+            prompt_scroll_top: 0,
             done: false,
             validation_error: None,
             list_keymap,
@@ -792,6 +790,7 @@ impl McpServerElicitationOverlay {
             })
             .collect();
         self.current_idx = 0;
+        self.prompt_scroll_top = 0;
         self.validation_error = None;
         self.composer
             .set_text_content(String::new(), Vec::new(), Vec::new());
@@ -946,9 +945,19 @@ impl McpServerElicitationOverlay {
     }
 
     fn wrapped_prompt_lines(&self, width: u16) -> Vec<String> {
-        textwrap::wrap(&self.current_prompt_text(), width.max(1) as usize)
-            .into_iter()
-            .map(|line| line.to_string())
+        let width = width.max(1) as usize;
+        self.current_prompt_text()
+            .split('\n')
+            .flat_map(|line| {
+                if line.is_empty() {
+                    vec![String::new()]
+                } else {
+                    textwrap::wrap(line, width)
+                        .into_iter()
+                        .map(|line| line.to_string())
+                        .collect()
+                }
+            })
             .collect()
     }
 
@@ -980,6 +989,26 @@ impl McpServerElicitationOverlay {
             sections.push(field_prompt);
         }
         sections.join("\n\n")
+    }
+
+    fn has_scrollable_approval_details(&self) -> bool {
+        !self.request.approval_display_params.is_empty()
+            && self.request.response_mode == McpServerElicitationResponseMode::ApprovalAction
+    }
+
+    fn scroll_prompt_page(&mut self, down: bool) {
+        if !self.has_scrollable_approval_details() {
+            return;
+        }
+        if down {
+            self.prompt_scroll_top = self
+                .prompt_scroll_top
+                .saturating_add(PROMPT_SCROLL_PAGE_LINES);
+        } else {
+            self.prompt_scroll_top = self
+                .prompt_scroll_top
+                .saturating_sub(PROMPT_SCROLL_PAGE_LINES);
+        }
     }
 
     fn footer_tips(&self) -> Vec<FooterTip> {
@@ -1282,12 +1311,18 @@ impl McpServerElicitationOverlay {
         }
     }
 
-    fn render_prompt(&self, area: Rect, buf: &mut Buffer) {
+    fn render_prompt(&self, area: Rect, scroll_top: usize, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         let answered = self.is_current_field_answered();
-        for (offset, line) in self.wrapped_prompt_lines(area.width).iter().enumerate() {
+        for (offset, line) in self
+            .wrapped_prompt_lines(area.width)
+            .iter()
+            .skip(scroll_top)
+            .take(area.height as usize)
+            .enumerate()
+        {
             let y = area.y.saturating_add(offset as u16);
             if y >= area.y + area.height {
                 break;
@@ -1333,7 +1368,15 @@ impl McpServerElicitationOverlay {
         }
     }
 
-    fn render_footer(&self, area: Rect, input_area_height: u16, buf: &mut Buffer) {
+    fn render_footer(
+        &self,
+        area: Rect,
+        input_area_height: u16,
+        prompt_total_lines: usize,
+        prompt_visible_height: u16,
+        prompt_scroll_top: usize,
+        buf: &mut Buffer,
+    ) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -1347,9 +1390,30 @@ impl McpServerElicitationOverlay {
         } else {
             None
         };
+        let details_tip = if self.has_scrollable_approval_details()
+            && prompt_visible_height > 0
+            && prompt_total_lines > prompt_visible_height as usize
+        {
+            let start = prompt_scroll_top.saturating_add(1).min(prompt_total_lines);
+            let end = prompt_scroll_top
+                .saturating_add(prompt_visible_height as usize)
+                .min(prompt_total_lines);
+            Some(FooterTip::new(format!(
+                "details {start}-{end}/{prompt_total_lines}"
+            )))
+        } else {
+            None
+        };
         let mut tip_lines = self.footer_tip_lines(area.width);
-        if let Some(prefix) = option_tip {
-            let mut tips = vec![prefix];
+        if option_tip.is_some() || details_tip.is_some() {
+            let mut tips = Vec::new();
+            if let Some(prefix) = option_tip {
+                tips.push(prefix);
+            }
+            if let Some(prefix) = details_tip {
+                tips.push(prefix);
+                tips.push(FooterTip::new("pgup/pgdn"));
+            }
             if let Some(first_line) = tip_lines.first_mut() {
                 let mut first = Vec::new();
                 std::mem::swap(first_line, &mut first);
@@ -1417,7 +1481,13 @@ impl Renderable for McpServerElicitationOverlay {
         remaining = remaining.saturating_sub(footer_height);
 
         let min_input_height = if self.current_field_is_select() {
-            u16::from(remaining > 0)
+            if self.has_scrollable_approval_details() {
+                self.options_required_height(content_area.width)
+                    .min(remaining)
+                    .max(u16::from(remaining > 0))
+            } else {
+                u16::from(remaining > 0)
+            }
         } else {
             MIN_COMPOSER_HEIGHT.min(remaining)
         };
@@ -1427,6 +1497,8 @@ impl Renderable for McpServerElicitationOverlay {
         let prompt_height = (prompt_lines.len() as u16).min(remaining);
         remaining = remaining.saturating_sub(prompt_height);
         input_height = input_height.saturating_add(remaining);
+        let max_prompt_scroll = prompt_lines.len().saturating_sub(prompt_height as usize);
+        let prompt_scroll_top = self.prompt_scroll_top.min(max_prompt_scroll);
 
         let progress_area = Rect {
             x: content_area.x,
@@ -1467,9 +1539,16 @@ impl Renderable for McpServerElicitationOverlay {
             Line::from("No fields".dim())
         };
         Paragraph::new(progress_line).render(progress_area, buf);
-        self.render_prompt(prompt_area, buf);
+        self.render_prompt(prompt_area, prompt_scroll_top, buf);
         self.render_input(input_area, buf);
-        self.render_footer(footer_area, input_area.height, buf);
+        self.render_footer(
+            footer_area,
+            input_area.height,
+            prompt_lines.len(),
+            prompt_area.height,
+            prompt_scroll_top,
+            buf,
+        );
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
@@ -1531,7 +1610,7 @@ impl BottomPaneView for McpServerElicitationOverlay {
                 code: KeyCode::PageUp,
                 modifiers: KeyModifiers::NONE,
                 ..
-            } => {
+            } if !self.has_scrollable_approval_details() => {
                 self.move_field(/*next*/ false);
                 return;
             }
@@ -1544,8 +1623,24 @@ impl BottomPaneView for McpServerElicitationOverlay {
                 code: KeyCode::PageDown,
                 modifiers: KeyModifiers::NONE,
                 ..
-            } => {
+            } if !self.has_scrollable_approval_details() => {
                 self.move_field(/*next*/ true);
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::PageUp,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.scroll_prompt_page(/*down*/ false);
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::PageDown,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.scroll_prompt_page(/*down*/ true);
                 return;
             }
             KeyEvent {
@@ -2727,6 +2822,55 @@ mod tests {
         insta::assert_snapshot!(
             "mcp_server_elicitation_approval_form_with_param_summary",
             render_snapshot(&overlay, Rect::new(0, 0, 120, 16))
+        );
+    }
+
+    #[test]
+    fn approval_form_tool_approval_long_command_can_scroll_details_snapshot() {
+        let (tx, _rx) = test_sender();
+        let long_command = [
+            "set -o pipefail",
+            "python3 - <<'PY'",
+            "import os, re, subprocess, textwrap",
+            "root = '/opt/aiopsterm/service'",
+            "for name in sorted(os.listdir(root)):",
+            "    print(name)",
+            "subprocess.run(['systemctl', 'status', 'aiopsterm-agent'], check=False)",
+            "print('audit complete')",
+            "PY",
+        ]
+        .join("\n");
+        let request = from_form_request(
+            ThreadId::default(),
+            form_request(
+                "Allow the aiopsterm_remote MCP server to run tool \"run_command\"?",
+                empty_object_schema(),
+                tool_approval_meta(
+                    &[],
+                    Some(serde_json::json!({
+                        "command": long_command,
+                        "timeoutMs": 30000,
+                    })),
+                    Some(vec![
+                        ("command", Value::String(long_command), "command"),
+                        ("timeoutMs", serde_json::json!(30000), "timeoutMs"),
+                    ]),
+                ),
+            ),
+        )
+        .expect("expected approval fallback");
+        let mut overlay = McpServerElicitationOverlay::new(
+            request, tx, /*has_input_focus*/ true, /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+
+        let before_scroll = render_snapshot(&overlay, Rect::new(0, 0, 72, 16));
+        overlay.handle_key_event(KeyEvent::from(KeyCode::PageDown));
+        let after_scroll = render_snapshot(&overlay, Rect::new(0, 0, 72, 16));
+
+        insta::assert_snapshot!(
+            "mcp_server_elicitation_approval_form_long_command_scroll",
+            format!("before scroll:\n{before_scroll}\n\nafter scroll:\n{after_scroll}")
         );
     }
 }
